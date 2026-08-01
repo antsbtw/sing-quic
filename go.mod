@@ -1,4 +1,4 @@
-module github.com/antsbtw/sing-quic
+module github.com/sagernet/sing-quic
 
 go 1.24.0
 

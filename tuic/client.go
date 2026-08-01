@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	qtls "github.com/antsbtw/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"

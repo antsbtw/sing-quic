@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	qtls "github.com/antsbtw/sing-quic"
-	hyCC "github.com/antsbtw/sing-quic/hysteria/congestion"
+	qtls "github.com/sagernet/sing-quic"
+	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/canceler"

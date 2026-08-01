@@ -7,7 +7,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/antsbtw/sing-quic/hysteria2/internal/stun"
+	"github.com/sagernet/sing-quic/hysteria2/internal/stun"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
