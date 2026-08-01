@@ -299,6 +299,12 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	if err != nil {
 		return nil, err
 	}
+	// Observation hooks are nil-checked at every site: DialObserver nil (the
+	// production default) leaves this path byte-identical to upstream.
+	dialObserver := c.realmOptions.DialObserver
+	if dialObserver != nil {
+		dialObserver.STUNDiscovered(localAddresses)
+	}
 	closeSurviving := func() {
 		for _, family := range surviving {
 			_ = family.conn.Close()
@@ -313,6 +319,12 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	if err != nil {
 		closeSurviving()
 		return nil, E.Cause(err, "realm connect")
+	}
+	if dialObserver != nil {
+		// ★ Report the SERVER's metadata (the one punching actually uses), not
+		// localMetadata — the receiver records this nonce, so pairing depends
+		// on it. Reporting localMetadata would silently never match.
+		dialObserver.RendezvousDone(response.Addresses, response.PunchMetadata)
 	}
 	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
 	if err != nil {
@@ -438,6 +450,7 @@ func (c *Client) realmRacePunch(
 		result realm.PunchResult
 		err    error
 	}
+	dialObserver := c.realmOptions.DialObserver
 	out := make(chan outcome, len(families))
 	for _, family := range families {
 		go func() {
@@ -446,6 +459,9 @@ func (c *Client) realmRacePunch(
 				if peer.Addr().Is4() == family.ipv4 {
 					peers = append(peers, peer)
 				}
+			}
+			if dialObserver != nil {
+				dialObserver.PunchAttempted(family.family, peers)
 			}
 			punchResult, punchErr := realm.Punch(raceCtx, family.conn, peers, metadata)
 			out <- outcome{family: family, result: punchResult, err: punchErr}
@@ -460,6 +476,9 @@ func (c *Client) realmRacePunch(
 					_ = family.conn.Close()
 				}
 			}
+			if dialObserver != nil {
+				dialObserver.PunchSettled(result.family.family, result.result, nil)
+			}
 			return result.family, result.result, nil
 		}
 		errs = append(errs, E.Cause(result.err, result.family.family))
@@ -467,7 +486,11 @@ func (c *Client) realmRacePunch(
 	for _, family := range families {
 		_ = family.conn.Close()
 	}
-	return nil, realm.PunchResult{}, E.Cause(E.Errors(errs...), "realm punch")
+	punchErr := E.Cause(E.Errors(errs...), "realm punch")
+	if dialObserver != nil {
+		dialObserver.PunchSettled("", realm.PunchResult{}, punchErr)
+	}
+	return nil, realm.PunchResult{}, punchErr
 }
 
 func (c *Client) authenticateAndWrap(ctx context.Context, packetConn net.PacketConn, peerAddr M.Socksaddr) (*clientQUICConnection, error) {

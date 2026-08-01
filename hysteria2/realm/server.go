@@ -38,6 +38,13 @@ type Options struct {
 	// (see PunchObserver). nil — the default — disables observation and keeps
 	// the punch path exactly as before.
 	Observer PunchObserver
+	// DialObserver, when non-nil, receives read-only notifications from the
+	// client-side punch flow (see DialObserver). nil — the default — disables
+	// observation and keeps the dial path exactly as before.
+	//
+	// Observer covers the answering side, DialObserver the initiating side;
+	// a given process normally sets only one of them.
+	DialObserver DialObserver
 }
 
 type Server struct {
