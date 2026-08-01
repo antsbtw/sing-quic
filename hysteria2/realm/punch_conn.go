@@ -7,7 +7,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/sagernet/sing-quic/hysteria2/internal/stun"
+	"github.com/antsbtw/sing-quic/hysteria2/internal/stun"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -29,6 +29,9 @@ type PunchPacketConn struct {
 	attempts   map[string]PunchMetadata
 	events     chan PunchPacketEvent
 	stunEvents chan STUNPacketEvent
+	// observer is set once (by Server.Start, before any reads) and never
+	// mutated afterwards; nil disables observation.
+	observer PunchObserver
 }
 
 func NewPunchPacketConn(conn net.PacketConn, eventBuffer int) *PunchPacketConn {
@@ -98,6 +101,11 @@ func (c *PunchPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				select {
 				case c.events <- PunchPacketEvent{AttemptID: attemptID, From: from, Type: packetType}:
 				default:
+				}
+				// Observer sees every valid packet even when the (bounded)
+				// event channel drops one, so first_recv stays accurate.
+				if c.observer != nil {
+					c.observer.PunchPacketReceived(attemptID, from, packetType)
 				}
 			}
 			matched = true

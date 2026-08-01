@@ -34,6 +34,10 @@ type Options struct {
 	STUNServers []string
 	Resolver    Resolver
 	Logger      logger.Logger
+	// Observer, when non-nil, receives read-only punch engine notifications
+	// (see PunchObserver). nil — the default — disables observation and keeps
+	// the punch path exactly as before.
+	Observer PunchObserver
 }
 
 type Server struct {
@@ -83,10 +87,12 @@ func NewServer(options Options) (*Server, error) {
 
 func (s *Server) Start(ctx context.Context, conn net.PacketConn) (*PunchPacketConn, error) {
 	punchConn := NewPunchPacketConn(conn, eventBufferSize)
+	punchConn.observer = s.options.Observer
 	s.punchConn = punchConn
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.puncher = NewServerPuncher(runCtx, punchConn)
+	s.puncher.observer = s.options.Observer
 	go s.run(runCtx)
 	s.Reset()
 	return punchConn, nil
@@ -233,7 +239,14 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 					s.options.Logger.Warn(E.Cause(postErr, "connect response post"))
 				}
 			}
-			result, punchErr := s.puncher.Respond(ctx, generateAttemptID(), peerAddresses, metadata)
+			attemptID := generateAttemptID()
+			if observer := s.options.Observer; observer != nil {
+				observer.PunchRequested(attemptID, metadata, peerAddresses, freshAddresses)
+			}
+			result, punchErr := s.puncher.Respond(ctx, attemptID, peerAddresses, metadata)
+			if observer := s.options.Observer; observer != nil {
+				observer.PunchFinished(attemptID, result, punchErr)
+			}
 			if punchErr != nil {
 				if !E.IsClosedOrCanceled(punchErr) {
 					s.options.Logger.Error(E.Cause(punchErr, "punch respond"))

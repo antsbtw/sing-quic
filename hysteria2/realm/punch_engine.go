@@ -82,6 +82,9 @@ type ServerPuncher struct {
 	attempts  map[string]chan PunchPacketEvent
 	done      chan struct{}
 	closeOnce sync.Once
+	// observer is set once (by Server.Start, before the event stream opens)
+	// and never mutated afterwards; nil disables observation.
+	observer PunchObserver
 }
 
 func NewServerPuncher(ctx context.Context, conn *PunchPacketConn) *ServerPuncher {
@@ -142,6 +145,9 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 		case event := <-eventCh:
 			if event.Type == PunchHello {
 				sendPunchPacket(p.conn, event.From, PunchAck, metadata)
+				if p.observer != nil {
+					p.observer.PunchAckSent(attemptID, event.From)
+				}
 			}
 			return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
 		case <-ticker.C:

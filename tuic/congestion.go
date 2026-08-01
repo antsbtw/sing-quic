@@ -6,10 +6,10 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
-	"github.com/sagernet/sing-quic/congestion_bbr1"
-	"github.com/sagernet/sing-quic/congestion_bbr2"
-	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
-	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+	"github.com/antsbtw/sing-quic/congestion_bbr1"
+	"github.com/antsbtw/sing-quic/congestion_bbr2"
+	congestion_meta1 "github.com/antsbtw/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/antsbtw/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common/ntp"
 )
 

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/sagernet/sing-quic/hysteria2/internal/stun"
+	"github.com/antsbtw/sing-quic/hysteria2/internal/stun"
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 )

@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	qtls "github.com/sagernet/sing-quic"
-	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
+	qtls "github.com/antsbtw/sing-quic"
+	hyCC "github.com/antsbtw/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/debug"

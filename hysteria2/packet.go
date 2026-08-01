@@ -15,7 +15,7 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/quicvarint"
-	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
+	"github.com/antsbtw/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/cache"
