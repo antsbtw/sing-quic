@@ -119,9 +119,15 @@ func (p *ServerPuncher) dispatch(ctx context.Context) {
 	}
 }
 
-func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddresses []netip.AddrPort, metadata PunchMetadata) (PunchResult, error) {
+// Respond 处理一次客户端打洞。passiveOnly=true 时进入 direct 模式：节点是固定公网
+// IP、无 NAT，不主动向客户端反射地址试探（那是"服务端主动发起"方向，会被客户端对称
+// NAT 挡掉且无必要），只被动等待客户端的 PunchHello 并原样回 PunchAck（回到 event.From
+// = 客户端主动发包的源，其 NAT 已为该会话放行回程）。这与标准 hysteria2 直连的 NAT
+// 行为一致，从而让固定 IP 节点对对称 NAT 客户端也能"打洞成功"。
+func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddresses []netip.AddrPort, metadata PunchMetadata, passiveOnly bool) (PunchResult, error) {
 	candidates := candidatePunchAddrs(peerAddresses)
-	if len(candidates) == 0 {
+	// direct 模式不主动试探，故无候选也无妨；非 direct 模式仍要求有候选。
+	if !passiveOnly && len(candidates) == 0 {
 		return PunchResult{}, E.New("no compatible peer addresses")
 	}
 	p.conn.AddAttempt(attemptID, metadata)
@@ -139,7 +145,9 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 	defer cancel()
 	ticker := time.NewTicker(punchInterval)
 	defer ticker.Stop()
-	sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+	if !passiveOnly {
+		sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+	}
 	for {
 		select {
 		case event := <-eventCh:
@@ -151,7 +159,9 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 			}
 			return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
 		case <-ticker.C:
-			sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+			if !passiveOnly {
+				sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+			}
 		case <-ctx.Done():
 			return PunchResult{}, E.Cause(ctx.Err(), "punch respond timeout")
 		}

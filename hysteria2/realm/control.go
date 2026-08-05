@@ -57,6 +57,15 @@ type Registration struct {
 type ConnectResponse struct {
 	Addresses     []netip.AddrPort
 	PunchMetadata PunchMetadata
+	// Relay 是会合面下发的中继地址（RELAY_FALLBACK_DESIGN.md §3.3bis）：
+	// 打洞失败时客户端连它、报同一 nonce，与节点的另一条流对接。
+	//
+	// ★与打洞地址【一起】下发，不是"失败后再问会合面"：客户端打洞失败是本地
+	// 10s 超时，它不会回头告知会合面（racePunch 失败直接 return）。等失败再问要
+	// 多一个往返，而客户端已经等了 10s。一起下发 = 零额外往返，代价仅几十字节。
+	//
+	// 空 = 该节点未配中继 → 客户端行为与改动前逐字节一致。
+	Relay []netip.AddrPort
 }
 
 type PunchEvent struct {
@@ -66,10 +75,16 @@ type PunchEvent struct {
 
 type registerRequest struct {
 	Addresses []netip.AddrPort `json:"addresses"`
+	// Relay 是本节点配置的中继地址（RELAY_FALLBACK_DESIGN.md §3.3bis）。
+	// 由节点上报、会合面原样转发给客户端 —— 会合面不持有这份配置，避免同一
+	// 事实出现第二个真源。空 = 未配中继（omitempty，老会合面忽略未知字段）。
+	Relay []netip.AddrPort `json:"relay,omitempty"`
 }
 
 type heartbeatRequest struct {
 	Addresses []netip.AddrPort `json:"addresses,omitempty"`
+	// 心跳同样带上：配置变更（加/撤中继）无需重新注册即可生效。
+	Relay []netip.AddrPort `json:"relay,omitempty"`
 }
 
 type heartbeatResponse struct {
@@ -80,6 +95,9 @@ type punchMetadataWire struct {
 	Addresses []netip.AddrPort `json:"addresses"`
 	Nonce     string           `json:"nonce"`
 	Obfs      string           `json:"obfs"`
+	// relay 只出现在会合面 → 客户端方向的 /connect 应答里；请求方向不带（omitempty）。
+	// 老会合面不返此字段 → 解析成空 → 回退不触发，与改动前行为一致。
+	Relay []netip.AddrPort `json:"relay,omitempty"`
 }
 
 type connectResponseRequest struct {
@@ -132,9 +150,9 @@ func (c *ControlClient) doJSON(ctx context.Context, method, requestURL, token st
 	return nil
 }
 
-func (c *ControlClient) Register(ctx context.Context, realmID string, addresses []netip.AddrPort) (*Registration, error) {
+func (c *ControlClient) Register(ctx context.Context, realmID string, addresses []netip.AddrPort, relay []netip.AddrPort) (*Registration, error) {
 	var registration Registration
-	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.token, registerRequest{Addresses: addresses}, &registration)
+	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.token, registerRequest{Addresses: addresses, Relay: relay}, &registration)
 	if err != nil {
 		return nil, E.Cause(err, "register")
 	}
@@ -149,9 +167,9 @@ func (c *ControlClient) Deregister(ctx context.Context, realmID string, sessionT
 	return nil
 }
 
-func (c *ControlClient) Heartbeat(ctx context.Context, realmID string, sessionToken string, addresses []netip.AddrPort) (int, error) {
+func (c *ControlClient) Heartbeat(ctx context.Context, realmID string, sessionToken string, addresses []netip.AddrPort, relay []netip.AddrPort) (int, error) {
 	var result heartbeatResponse
-	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, "/heartbeat"), sessionToken, heartbeatRequest{Addresses: addresses}, &result)
+	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, "/heartbeat"), sessionToken, heartbeatRequest{Addresses: addresses, Relay: relay}, &result)
 	if err != nil {
 		return 0, E.Cause(err, "heartbeat")
 	}
@@ -172,7 +190,7 @@ func (c *ControlClient) Connect(ctx context.Context, realmID string, addresses [
 	if err != nil {
 		return nil, E.Cause(err, "decode connect response metadata")
 	}
-	return &ConnectResponse{Addresses: raw.Addresses, PunchMetadata: metaOut}, nil
+	return &ConnectResponse{Addresses: raw.Addresses, PunchMetadata: metaOut, Relay: raw.Relay}, nil
 }
 
 func (c *ControlClient) ConnectResponse(ctx context.Context, realmID string, sessionToken string, nonce string, addresses []netip.AddrPort) error {

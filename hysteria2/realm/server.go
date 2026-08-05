@@ -32,8 +32,22 @@ type Options struct {
 	HTTPClient  *http.Client
 	RealmID     string
 	STUNServers []string
-	Resolver    Resolver
-	Logger      logger.Logger
+	// DirectAddresses 非空 → 固定地址模式（direct mode）：节点是固定公网 IP、无 NAT
+	// （或 1:1 静态 NAT，如 AWS Elastic IP）的 VPS，无需 STUN 反射 + 双向打洞对撞。
+	// 节点直接把这些地址（真实公网 IP:port）上报给客户端当"打洞"目标；客户端照常
+	// 主动发 PunchHello（无需改客户端），由于是客户端主动发起、目标是固定地址，其
+	// NAT 会为该会话放行回程（与标准 hysteria2 直连的 NAT 行为一致）——从而绕开
+	// "对称 NAT + 打洞对撞失败"。空 → 完全走原 STUN + 打洞逻辑（默认，其它节点不受影响）。
+	DirectAddresses []netip.AddrPort
+	// RelayAddresses 非空 → 启用中继回退（RELAY_FALLBACK_DESIGN.md §3.2）：
+	// 收到会合面打洞事件时，本节点在打洞的同时向这些中继报到（报事件里的 nonce）。
+	// 客户端打洞失败转中继时，两条流按 nonce 对接，握手端到端跑通，出口仍是本节点。
+	//
+	// 与 DirectAddresses 同型：空 = 不启用，行为与改动前逐字节一致。
+	// 打洞成功时客户端不会去连中继，中继侧等待项超时自动回收 —— 零成本。
+	RelayAddresses []netip.AddrPort
+	Resolver       Resolver
+	Logger         logger.Logger
 	// Observer, when non-nil, receives read-only punch engine notifications
 	// (see PunchObserver). nil — the default — disables observation and keeps
 	// the punch path exactly as before.
@@ -71,10 +85,11 @@ func NewServer(options Options) (*Server, error) {
 	if options.RealmID == "" {
 		return nil, E.New("realm ID is required")
 	}
-	if len(options.STUNServers) == 0 {
+	// direct 模式无需 STUN（用固定地址代替反射发现）；仅非 direct 模式强制 STUN。
+	if len(options.DirectAddresses) == 0 && len(options.STUNServers) == 0 {
 		return nil, E.New("at least one STUN server is required")
 	}
-	if options.Resolver == nil {
+	if len(options.DirectAddresses) == 0 && options.Resolver == nil {
 		return nil, E.New("resolver is required")
 	}
 	return &Server{
@@ -243,7 +258,20 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 			if observer := s.options.Observer; observer != nil {
 				observer.PunchRequested(attemptID, metadata, peerAddresses, freshAddresses)
 			}
-			result, punchErr := s.puncher.Respond(ctx, attemptID, peerAddresses, metadata)
+			// ★中继回退（§3.2）：与打洞**并行**去中继报到同一个 nonce。
+			// 必须并行而不是"打洞失败后再连"——本节点不知道客户端失败了
+			// （客户端失败是它本地 10s 超时，不会回头通知任何人），等失败再报到，
+			// 客户端早已超时。打洞成功则客户端不来，中继等待项自然超时回收。
+			//
+			// 🔴 传 s.punchConn：协议服务端监听的就是这只 socket，中继转发来的
+			// 客户端流量必须落到它上面才能进协议栈（见 relay.go 文件头）。
+			if len(s.options.RelayAddresses) > 0 {
+				go joinRelays(ctx, s.punchConn, s.options.RelayAddresses, metadata.Nonce)
+			}
+			// direct 模式仅被动应答：不主动试探客户端反射地址（那是"服务端主动发起"
+			// 方向，会被客户端对称 NAT 挡掉且无必要）。
+			passiveOnly := len(s.options.DirectAddresses) > 0
+			result, punchErr := s.puncher.Respond(ctx, attemptID, peerAddresses, metadata, passiveOnly)
 			if observer := s.options.Observer; observer != nil {
 				observer.PunchFinished(attemptID, result, punchErr)
 			}
@@ -282,6 +310,18 @@ func (s *Server) resolvedSTUNServers(ctx context.Context) ([]netip.AddrPort, err
 }
 
 func (s *Server) connectAddresses(ctx context.Context) ([]netip.AddrPort, error) {
+	// direct 模式：固定公网地址，不跑 STUN。所有地址来源（注册/心跳发布/Connect 应答）
+	// 都经此函数，这一处短路即全覆盖。缓存进 s.addresses 以复用既有发布/注册路径。
+	if len(s.options.DirectAddresses) > 0 {
+		s.addressAccess.Lock()
+		if s.addresses == nil {
+			s.addresses = slices.Clone(s.options.DirectAddresses)
+			s.addressesAt = time.Now()
+		}
+		addrs := slices.Clone(s.addresses)
+		s.addressAccess.Unlock()
+		return addrs, nil
+	}
 	cached := s.cachedAddresses()
 	if cached != nil {
 		return cached, nil
@@ -336,7 +376,7 @@ func (s *Server) handleHeartbeat(ctx context.Context) {
 		publish = slices.Clone(s.addresses)
 	}
 	s.addressAccess.RUnlock()
-	ttl, err := s.controlClient.Heartbeat(ctx, s.options.RealmID, sessionID, publish)
+	ttl, err := s.controlClient.Heartbeat(ctx, s.options.RealmID, sessionID, publish, s.options.RelayAddresses)
 	if err != nil {
 		statusErr, isStatus := E.Cast[*StatusError](err)
 		switch {
@@ -392,7 +432,7 @@ func (s *Server) reRegister(ctx context.Context) {
 	s.addressAccess.RLock()
 	addresses := slices.Clone(s.addresses)
 	s.addressAccess.RUnlock()
-	registration, err := s.controlClient.Register(ctx, s.options.RealmID, addresses)
+	registration, err := s.controlClient.Register(ctx, s.options.RealmID, addresses, s.options.RelayAddresses)
 	if err != nil {
 		s.options.Logger.Warn(E.Cause(err, "re-register"))
 		return
