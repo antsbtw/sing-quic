@@ -28,9 +28,23 @@ const (
 	// relayJoinInterval 是 join 重发间隔。UDP 无重传，且客户端可能比本节点晚到，
 	// 中继对同源重复 join 幂等（刷新等待、不自配对），所以在窗口内持续重发。
 	relayJoinInterval = 500 * time.Millisecond
-	// relayJoinWindow 是节点侧报到窗口，与打洞窗口同量级：
-	// 客户端打洞失败后才转中继，本节点须在那之前就已在中继上等着。
-	relayJoinWindow = punchTimeout
+	// relayJoinWindow 是节点侧报到窗口。
+	//
+	// 🔴 必须覆盖「客户端打洞超时 + 客户端中继握手超时」这整段，不能只等于
+	// punchTimeout —— 两侧窗口都是 10s 但**起点差了一整个打洞周期**：
+	//
+	//	节点   ├── join 窗口 10s ──┤                        (T .. T+10s)
+	//	客户端 ├──── 打洞 10s ─────┼── 找中继 10s ──┤       (T+10s .. T+20s)
+	//	                          ↑ 节点此刻已经走了，客户端扑空
+	//
+	// 2026-08-06 蜂窝实测抓到：客户端 13:43:01 到中继 waiting for peer，
+	// 节点全程未出现，13:43:26 pairing expired；同一配置前一次(13:42)只因
+	// 节点事件恰好晚到 10s 才碰巧配上 —— 是竞态，不是可用。
+	//
+	// 取 2×punchTimeout + 余量：覆盖客户端最坏情况（打洞耗满 10s 再等中继 10s）。
+	// 代价可忽略：打洞成功时客户端不会来，中继侧等待项自行超时回收（每 500ms
+	// 一个 20 字节包）。宁可多等，也不能让回退变成掷骰子。
+	relayJoinWindow = 2*punchTimeout + 5*time.Second
 )
 
 // relayMagic / relayJoinLen 必须与 otun-relay 仓、以及客户端内核
