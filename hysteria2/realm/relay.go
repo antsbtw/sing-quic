@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/netip"
 	"time"
+
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // ★中继回退 —— 节点侧（RELAY_FALLBACK_DESIGN.md §3.2 / §3.5.0）
@@ -54,7 +56,189 @@ var relayMagic = [4]byte{'O', 'T', 'R', 'L'}
 const (
 	relayNonceLen = 16
 	relayJoinLen  = 4 + relayNonceLen
+	// relayHandshakeTimeout 是客户端等中继回 ack（对端已到、配对完成）的上限。
+	// 与 otun-kernel transport/realm/relay.go 保持一致。
+	relayHandshakeTimeout = 10 * time.Second
 )
+
+// isRelayJoinAck 判断数据报是否是中继对本 nonce 的配对确认。
+// 中继把首包原样回给双方作为 ack，判据 = 逐字节等于我们发出的 join。
+func isRelayJoinAck(payload []byte, nonce [relayNonceLen]byte) bool {
+	if len(payload) != relayJoinLen {
+		return false
+	}
+	if [4]byte(payload[:4]) != relayMagic {
+		return false
+	}
+	return [relayNonceLen]byte(payload[4:relayJoinLen]) == nonce
+}
+
+// RelayJoinClient 是客户端侧的中继报到：在 conn 上向中继报 nonce，
+// 等 ack（= 节点已到、两条流已对接），成功后返回中继地址供上层当作 peer。
+//
+// 🔴 与节点侧 joinRelays 的对称点：客户端也必须复用**将要承载握手的那只
+// socket** —— 调用方把打洞用的 socket 传进来，QUIC 握手随后就在其上跑，
+// 源地址一致中继才认得出是同一条流。
+//
+// 🔴 必须等到 ack 再返回，不能"发完就当成功"：中继在对端到达前只是把我们挂起，
+// 此时把 conn 交给上层，QUIC 握手会朝没对接的管道发包，直到超时才失败 ——
+// 失败更慢，且错误被归成协议层超时而非中继未配对，排障困难。
+func RelayJoinClient(
+	ctx context.Context,
+	conn net.PacketConn,
+	relayAddr netip.AddrPort,
+	nonce [relayNonceLen]byte,
+) error {
+	ctx, cancel := context.WithTimeout(ctx, relayHandshakeTimeout)
+	defer cancel()
+
+	join := encodeRelayJoin(nonce)
+	target := net.UDPAddrFromAddrPort(relayAddr)
+
+	// 重发 goroutine：UDP 首包可能丢，中继对同源重复 join 幂等。
+	sendDone := make(chan struct{})
+	defer close(sendDone)
+	go func() {
+		ticker := time.NewTicker(relayJoinInterval)
+		defer ticker.Stop()
+		for {
+			_, _ = conn.WriteTo(join, target)
+			select {
+			case <-ticker.C:
+			case <-sendDone:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// ctx 到期时解除 ReadFrom 阻塞。
+	readDone := make(chan struct{})
+	defer close(readDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetReadDeadline(time.Now())
+		case <-readDone:
+		}
+	}()
+
+	buffer := make([]byte, 2048)
+	for {
+		n, from, err := conn.ReadFrom(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return E.New("relay pairing timeout")
+			}
+			return E.Cause(err, "read relay ack")
+		}
+		udpAddr, ok := from.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+		ap := udpAddr.AddrPort()
+		if netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()) != relayAddr {
+			// 不是中继来的包（扫描/串扰）——丢弃继续等。
+			continue
+		}
+		if !isRelayJoinAck(buffer[:n], nonce) {
+			// 对端数据可能先于 ack 到达。此时 conn 还没交出去，丢弃是安全的：
+			// QUIC 首个握手包由上层重传，不依赖这一个数据报。
+			continue
+		}
+		// 清掉为超时设的读截止时间，交回上层前必须是干净的 socket。
+		_ = conn.SetReadDeadline(time.Time{})
+		return nil
+	}
+}
+
+// RaceRelayJoin 对多台中继**并发竞速**报到，返回第一台配对成功的地址。
+//
+// 🔴 并发而非顺序重试：顺序下第一台不可达就要死等 relayHandshakeTimeout，
+// 耗光 ctx 预算，后面的中继根本没机会试，多候选形同虚设。
+//
+// 🔴 与 kernel 侧 DialRelay 的差异：这里**所有中继共用调用方传入的同一只
+// socket**（hy2 客户端必须在打洞用的那只 socket 上继续握手），所以竞速的是
+// "谁先回 ack"，赢家定了就直接用这只 socket，无需关闭任何东西。
+func RaceRelayJoin(
+	ctx context.Context,
+	conn net.PacketConn,
+	relayAddresses []netip.AddrPort,
+	nonce [relayNonceLen]byte,
+) (netip.AddrPort, error) {
+	if len(relayAddresses) == 0 {
+		return netip.AddrPort{}, E.New("realm relay: no relay address")
+	}
+	// 单台时不必起 goroutine，也避免并发读同一只 socket。
+	if len(relayAddresses) == 1 {
+		if err := RelayJoinClient(ctx, conn, relayAddresses[0], nonce); err != nil {
+			return netip.AddrPort{}, E.Cause(err, relayAddresses[0].String())
+		}
+		return relayAddresses[0], nil
+	}
+	// 🔴 多台中继共用一只 socket，不能并发 ReadFrom（会互相抢包）。
+	// 改为：同一只 socket 上向全部中继并发**发** join，单一读循环认第一个
+	// 回 ack 的中继为赢家 —— 竞速语义不变，且没有读竞争。
+	ctx, cancel := context.WithTimeout(ctx, relayHandshakeTimeout)
+	defer cancel()
+
+	join := encodeRelayJoin(nonce)
+	sendDone := make(chan struct{})
+	defer close(sendDone)
+	go func() {
+		ticker := time.NewTicker(relayJoinInterval)
+		defer ticker.Stop()
+		for {
+			for _, addr := range relayAddresses {
+				_, _ = conn.WriteTo(join, net.UDPAddrFromAddrPort(addr))
+			}
+			select {
+			case <-ticker.C:
+			case <-sendDone:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	readDone := make(chan struct{})
+	defer close(readDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetReadDeadline(time.Now())
+		case <-readDone:
+		}
+	}()
+
+	known := make(map[netip.AddrPort]bool, len(relayAddresses))
+	for _, addr := range relayAddresses {
+		known[addr] = true
+	}
+	buffer := make([]byte, 2048)
+	for {
+		n, from, err := conn.ReadFrom(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return netip.AddrPort{}, E.New("relay pairing timeout")
+			}
+			return netip.AddrPort{}, E.Cause(err, "read relay ack")
+		}
+		udpAddr, ok := from.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+		ap := udpAddr.AddrPort()
+		fromAddr := netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+		if !known[fromAddr] || !isRelayJoinAck(buffer[:n], nonce) {
+			continue
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		return fromAddr, nil
+	}
+}
 
 func encodeRelayJoin(nonce [relayNonceLen]byte) []byte {
 	out := make([]byte, relayJoinLen)

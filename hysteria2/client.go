@@ -315,16 +315,47 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 		return nil, E.Cause(err, "realm connect")
 	}
 	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
+	var peerAddr M.Socksaddr
+	var rawConn net.PacketConn
 	if err != nil {
-		return nil, err
+		// ★中继回退（RELAY_FALLBACK_DESIGN.md §3.1）：对称 NAT 下打洞必败，
+		// 改由客户端与节点各自主动出站连中继、按 nonce 对接。
+		//
+		// 🔴 这条路径原先**缺失** —— 六协议里只有 hy2 走 squic 这条老客户端
+		// 实现，其余五协议走 kernel transport/realm 的 PunchTraced（那边一直有
+		// 回退）。2026-08-06 蜂窝实测用 hy2 配置反复看不到任何 relay 尝试，
+		// 根因就是这里，不是中继或会合面的问题。
+		//
+		// 🔴 三条硬约束（与 kernel 侧逐条对齐）：
+		//  1. 只在会合面下发了 relay 时触发；空则一行不执行，老会合面行为不变。
+		//  2. 复用打洞用的 socket 继续握手 —— hy2 服务端按源地址解复用，
+		//     换 socket 收到的字节进不了协议栈。
+		//  3. 回退失败时返回**原打洞错误**，错误原文一字不改（既有归类依赖它）。
+		if len(response.Relay) == 0 {
+			return nil, err
+		}
+		// realmRacePunch 失败时关闭了全部 socket，中继需要一只新的。
+		relayConn, listenErr := c.dialer.ListenPacket(ctx, M.SocksaddrFrom(netip.IPv4Unspecified(), 0))
+		if listenErr != nil {
+			return nil, err
+		}
+		relayAddr, relayErr := realm.RaceRelayJoin(ctx, relayConn, response.Relay, response.PunchMetadata.Nonce)
+		if relayErr != nil {
+			_ = relayConn.Close()
+			return nil, err
+		}
+		rawConn = relayConn
+		peerAddr = M.SocksaddrFromNetIP(relayAddr)
+	} else {
+		rawConn = winner.conn
+		peerAddr = M.SocksaddrFromNetIP(result.PeerAddr)
 	}
-	packetConn := winner.conn
+	packetConn := rawConn
 	if c.geckoPassword != "" {
 		packetConn = NewGeckoConn(packetConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
 	} else if c.salamanderPassword != "" {
 		packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
 	}
-	peerAddr := M.SocksaddrFromNetIP(result.PeerAddr)
 	return c.authenticateAndWrap(ctx, packetConn, peerAddr)
 }
 
