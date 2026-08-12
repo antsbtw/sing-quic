@@ -238,6 +238,21 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 		peerAddresses := event.Addresses
 		metadata := event.PunchMetadata
 		go func() {
+			// ★中继报到必须**第一件事**做，先于 STUN（§3.2）。
+			//
+			// 🔴 2026-08-12 蜂窝实测抓到的真因：joinRelays 原先排在
+			// connectAddresses(STUN 探测) 之后，而 STUN 是同步阻塞的。节点被
+			// 其他用户的打洞打满时（实测 14:01:38-52 有 10 次 punch successful），
+			// STUN 排队/超时把 join 推迟到客户端早已放弃之后 —— 中继上只见
+			// 客户端 waiting for peer、节点始终不出现，表现为"回退时灵时不灵"
+			// （实测成功率约 1/3，且与 join 窗口长短无关，加长窗口治不了）。
+			//
+			// join 只需要 nonce，与 STUN 结果、与 ConnectResponse 都无依赖，
+			// 没有任何理由排在它们后面。提前后：节点在客户端打洞的 10s 里
+			// 就已在中继就位，客户端转中继时必定能配上。
+			if len(s.options.RelayAddresses) > 0 {
+				go joinRelays(ctx, s.punchConn, s.options.RelayAddresses, metadata.Nonce)
+			}
 			freshAddresses, stunErr := s.connectAddresses(ctx)
 			if stunErr != nil {
 				s.options.Logger.Warn(E.Cause(stunErr, "connect STUN failed; using last-known addresses"))
@@ -258,16 +273,14 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 			if observer := s.options.Observer; observer != nil {
 				observer.PunchRequested(attemptID, metadata, peerAddresses, freshAddresses)
 			}
-			// ★中继回退（§3.2）：与打洞**并行**去中继报到同一个 nonce。
-			// 必须并行而不是"打洞失败后再连"——本节点不知道客户端失败了
-			// （客户端失败是它本地 10s 超时，不会回头通知任何人），等失败再报到，
-			// 客户端早已超时。打洞成功则客户端不来，中继等待项自然超时回收。
+			// 中继报到已在本 goroutine 开头发起（提前到 STUN 之前，见上方注释）：
+			// 与打洞**并行**报同一个 nonce。必须并行而不是"打洞失败后再连"——
+			// 本节点不知道客户端失败了（客户端失败是它本地 10s 超时，不会回头
+			// 通知任何人），等失败再报到，客户端早已超时。打洞成功则客户端不来，
+			// 中继等待项自然超时回收。
 			//
 			// 🔴 传 s.punchConn：协议服务端监听的就是这只 socket，中继转发来的
 			// 客户端流量必须落到它上面才能进协议栈（见 relay.go 文件头）。
-			if len(s.options.RelayAddresses) > 0 {
-				go joinRelays(ctx, s.punchConn, s.options.RelayAddresses, metadata.Nonce)
-			}
 			// direct 模式仅被动应答：不主动试探客户端反射地址（那是"服务端主动发起"
 			// 方向，会被客户端对称 NAT 挡掉且无必要）。
 			passiveOnly := len(s.options.DirectAddresses) > 0
