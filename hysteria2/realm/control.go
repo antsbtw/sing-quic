@@ -71,6 +71,11 @@ type ConnectResponse struct {
 type PunchEvent struct {
 	Addresses     []netip.AddrPort
 	PunchMetadata PunchMetadata
+	// Relay 是会合面为**本次连接**选定的中继（1 主 + 1 备，RELAY_SCHEDULING_DESIGN
+	// §4.2/§4.3）：客户端拿到的是同一份选台结果，双方落同一台配对必成（配对铁律）。
+	// 节点侧 joinRelays 应只报这几台（与本地 RelayAddresses 白名单取交集），
+	// 而非配置全量。空 = 老会合面（不选台）→ 节点回退到配置全量，行为与改动前一致。
+	Relay []netip.AddrPort
 }
 
 type registerRequest struct {
@@ -95,8 +100,10 @@ type punchMetadataWire struct {
 	Addresses []netip.AddrPort `json:"addresses"`
 	Nonce     string           `json:"nonce"`
 	Obfs      string           `json:"obfs"`
-	// relay 只出现在会合面 → 客户端方向的 /connect 应答里；请求方向不带（omitempty）。
-	// 老会合面不返此字段 → 解析成空 → 回退不触发，与改动前行为一致。
+	// relay 出现在会合面 → 客户端的 /connect 应答、以及会合面 → 节点的打洞
+	// 事件里（自会合面选台起是**同一份**选定结果，1 主 + 1 备）；请求方向不带
+	// （omitempty）。老会合面不返此字段 → 解析成空 → 客户端不触发回退、节点
+	// 用配置全量，行为与改动前一致。
 	Relay []netip.AddrPort `json:"relay,omitempty"`
 }
 
@@ -250,7 +257,7 @@ func (s *EventStream) Next() (*PunchEvent, error) {
 					dataBuilder.Reset()
 					continue
 				}
-				return &PunchEvent{Addresses: raw.Addresses, PunchMetadata: metadata}, nil
+				return &PunchEvent{Addresses: raw.Addresses, PunchMetadata: metadata, Relay: raw.Relay}, nil
 			}
 			eventType = ""
 			dataBuilder.Reset()

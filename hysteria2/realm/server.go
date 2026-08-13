@@ -251,7 +251,13 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 			// 没有任何理由排在它们后面。提前后：节点在客户端打洞的 10s 里
 			// 就已在中继就位，客户端转中继时必定能配上。
 			if len(s.options.RelayAddresses) > 0 {
-				go joinRelays(ctx, s.punchConn, s.options.RelayAddresses, metadata.Nonce)
+				// ★报到目标 = 会合面为本次连接选定的台（event.Relay，1 主+1 备）
+				// 与本地配置白名单的交集（RELAY_SCHEDULING_DESIGN §4.3）：
+				// 客户端拿到的是同一份选定结果，节点只报这几台，双方同台配对
+				// 由设计保证而非全量竞速的概率。RelayAddresses 的角色收窄为
+				// "本节点允许用哪些中继"的白名单，防会合面塞进未授权的台。
+				// 事件不带 relay（老会合面不选台）→ 回退到配置全量，行为不变。
+				go joinRelays(ctx, s.punchConn, selectJoinTargets(event.Relay, s.options.RelayAddresses), metadata.Nonce)
 			}
 			freshAddresses, stunErr := s.connectAddresses(ctx)
 			if stunErr != nil {

@@ -247,6 +247,35 @@ func encodeRelayJoin(nonce [relayNonceLen]byte) []byte {
 	return out
 }
 
+// selectJoinTargets 决定本次连接向哪些中继报到（RELAY_SCHEDULING_DESIGN §4.3）：
+// 会合面选定台（assigned，1 主 + 1 备）∩ 本地配置白名单（whitelist）。
+//
+//   - assigned 空 = 老会合面不选台 → 用配置全量（行为与改动前一致）；
+//   - 交集保序（assigned 的顺序 = 主备优先序，虽然 join 是并发广播、顺序不影响
+//     语义，保序让日志可读）；
+//   - 交集空 = 配置漂移（会合面选台源于本节点自报列表，正常不会发生）→ 防御性
+//     回退配置全量：白名单本意是"防会合面塞未授权的台"，漂移时报全量不违反它，
+//     且保留配对成功的机会。
+func selectJoinTargets(assigned, whitelist []netip.AddrPort) []netip.AddrPort {
+	if len(assigned) == 0 {
+		return whitelist
+	}
+	allowed := make(map[netip.AddrPort]bool, len(whitelist))
+	for _, addr := range whitelist {
+		allowed[addr] = true
+	}
+	var targets []netip.AddrPort
+	for _, addr := range assigned {
+		if allowed[addr] {
+			targets = append(targets, addr)
+		}
+	}
+	if len(targets) == 0 {
+		return whitelist
+	}
+	return targets
+}
+
 // joinRelays 在打洞窗口内持续向每台中继报到，报的是本次连接的 nonce。
 //
 // 阻塞直到 ctx 结束（调用方用 goroutine 起它，与 Respond 并行 —— 打洞与中继
