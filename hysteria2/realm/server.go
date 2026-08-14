@@ -39,12 +39,10 @@ type Options struct {
 	// NAT 会为该会话放行回程（与标准 hysteria2 直连的 NAT 行为一致）——从而绕开
 	// "对称 NAT + 打洞对撞失败"。空 → 完全走原 STUN + 打洞逻辑（默认，其它节点不受影响）。
 	DirectAddresses []netip.AddrPort
-	// RelayAddresses 非空 → 启用中继回退（RELAY_FALLBACK_DESIGN.md §3.2）：
-	// 收到会合面打洞事件时，本节点在打洞的同时向这些中继报到（报事件里的 nonce）。
-	// 客户端打洞失败转中继时，两条流按 nonce 对接，握手端到端跑通，出口仍是本节点。
-	//
-	// 与 DirectAddresses 同型：空 = 不启用，行为与改动前逐字节一致。
-	// 打洞成功时客户端不会去连中继，中继侧等待项超时自动回收 —— 零成本。
+	// RelayAddresses ⚠️ 已退化为纯自报腿（A3，RELAY_FLEET_BOUNDARY_DESIGN §2）：
+	// 只随 Register/Heartbeat 上报会合面作老会合面的回退候选，**不再参与 join
+	// 决策**——报到目标只认打洞事件里会合面选定的 event.Relay（授权真源在 fleet）。
+	// manager 停发 relay_addresses 后本字段自然恒空，届时自报腿彻底退役。
 	RelayAddresses []netip.AddrPort
 	Resolver       Resolver
 	Logger         logger.Logger
@@ -250,14 +248,15 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 			// join 只需要 nonce，与 STUN 结果、与 ConnectResponse 都无依赖，
 			// 没有任何理由排在它们后面。提前后：节点在客户端打洞的 10s 里
 			// 就已在中继就位，客户端转中继时必定能配上。
-			if len(s.options.RelayAddresses) > 0 {
-				// ★报到目标 = 会合面为本次连接选定的台（event.Relay，1 主+1 备）
-				// 与本地配置白名单的交集（RELAY_SCHEDULING_DESIGN §4.3）：
-				// 客户端拿到的是同一份选定结果，节点只报这几台，双方同台配对
-				// 由设计保证而非全量竞速的概率。RelayAddresses 的角色收窄为
-				// "本节点允许用哪些中继"的白名单，防会合面塞进未授权的台。
-				// 事件不带 relay（老会合面不选台）→ 回退到配置全量，行为不变。
-				go joinRelays(ctx, s.punchConn, selectJoinTargets(event.Relay, s.options.RelayAddresses), metadata.Nonce)
+			// ★A3（RELAY_FLEET_BOUNDARY_DESIGN §2/§6 决策1）：报到目标 = 会合面为
+			// 本次连接选定的台（event.Relay，1 主+1 备），仅此一源。客户端拿到的是
+			// 同一份选定结果，双方同台配对由设计保证。授权唯一真源在 fleet
+			//（会合面候选本就出自 egress_relay_allow），本地白名单交集已删——
+			// 同一份授权在链路上出现两次没有增益（feedback_module_responsibility_clarity）。
+			// 事件不带 relay（该 egress 无授权中继 / 老会合面 / 排水中）→ 不报到，
+			// 与配置驱动时代 RelayAddresses 为空的行为同型。
+			if len(event.Relay) > 0 {
+				go joinRelays(ctx, s.punchConn, event.Relay, metadata.Nonce)
 			}
 			freshAddresses, stunErr := s.connectAddresses(ctx)
 			if stunErr != nil {
