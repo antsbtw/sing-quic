@@ -16,6 +16,30 @@ const (
 	punchTimeout  = 10 * time.Second
 	punchInterval = 100 * time.Millisecond
 
+	// punchConfirmWindow 是节点侧「往返确认」窗口（假成功修复，2026-08-29）。
+	//
+	// 背景实证：freely.gx（中国移动蜂窝，对称 NAT）连 egress-nj-01，节点日志连续
+	// 20 次 "punch successful"，其后**零条** egress 数据，用户表现为"连上了但什么
+	// 都打不开、诊断也发不出去"，直到某次重试撞对端口才自愈（16:48 一秒内涌出 ~28
+	// 条积压请求，吞吐从 0.03Mbps 跳到 19.95Mbps）。
+	//
+	// 根因：Respond 收到一个 PunchHello 就宣告成功，而这只证明"客户端→节点"单向
+	// 可达；回程 PunchAck 是 fire-and-forget（sendPunchPacket 内 WriteTo 的错误被
+	// 显式丢弃），落到对称 NAT 上没有映射的端口即被丢弃，形成"单向洞"。
+	//
+	// 更糟的是它绕过了中继回退：中继只在打洞"失败"时接管，假成功让两侧都认为成功
+	// 了，回退链根本不进入（nj-01 已授权并下发 relay_addresses，却 2 天零中继活动）。
+	// 故修好判定 = 同时解锁中继。
+	//
+	// 判据：客户端 realm.Punch 一旦成功，会立刻在**同一只 socket** 上发起 QUIC
+	// 握手。因此"收到来自该 peer 的非打洞报文"是回程可达的硬证据，且不要求客户端
+	// 做任何改动（老客户端同样发握手）——见 PunchPacketConn.WatchPeerTraffic。
+	//
+	// 窗口取 1.5s：覆盖一个 RTT + 客户端从打洞返回到发出首个 QUIC 包的调度延迟
+	// （跨境 RTT 实测 200-300ms，留 5x 余量），同时远小于 punchTimeout=10s，
+	// 失败后仍有充裕时间继续试其他候选。
+	punchConfirmWindow = 1500 * time.Millisecond
+
 	symmetricNATPortGap         = 4
 	symmetricNATExtraPorts      = 4
 	symmetricNATMaxPortsPerHost = 32
@@ -151,19 +175,85 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 	for {
 		select {
 		case event := <-eventCh:
-			if event.Type == PunchHello {
-				sendPunchPacket(p.conn, event.From, PunchAck, metadata)
-				if p.observer != nil {
-					p.observer.PunchAckSent(attemptID, event.From)
-				}
+			if event.Type == PunchAck {
+				// 收到对端 Ack 本身就是往返证据：我方 Hello 到了对端，对端的 Ack 回到我。
+				return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
 			}
-			return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
+			// 收到 Hello：只证明入向单向可达。回 Ack 后必须确认回程真的通，
+			// 否则就是「假成功」（详见 punchConfirmWindow 注释）。
+			//
+			// 🔴 观察点必须在**发 Ack 之前**登记：低延迟链路上对端的 QUIC 首包
+			// 可能在登记完成前就到达，那一刻若还没登记，这个唯一的确认信号就被
+			// 永久丢掉，本可成功的连接会被误判失败。
+			trafficCh := p.conn.WatchPeerTraffic(event.From)
+			sendPunchPacket(p.conn, event.From, PunchAck, metadata)
+			if p.observer != nil {
+				p.observer.PunchAckSent(attemptID, event.From)
+			}
+			confirmed := p.confirmRoundTrip(ctx, trafficCh, eventCh, metadata, candidates, passiveOnly, ticker, attemptID)
+			p.conn.UnwatchPeerTraffic(event.From)
+			if confirmed {
+				return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
+			}
+			// 未确认：不宣告成功，继续在剩余 punchTimeout 内试其他候选。
+			// 这也让中继回退得以在真正失败时接管。
 		case <-ticker.C:
 			if !passiveOnly {
 				sendPunchPackets(p.conn, candidates, PunchHello, metadata)
 			}
 		case <-ctx.Done():
 			return PunchResult{}, E.Cause(ctx.Err(), "punch respond timeout")
+		}
+	}
+}
+
+// confirmRoundTrip 在回过 PunchAck 之后，等待「回程确实可达」的证据，
+// 返回 true 表示已确认。两类证据任一即可：
+//
+//	① 对端的 PunchAck —— 对端收到了我的 Hello 并应答（双向已通）；
+//	② 对端发来的任何非打洞报文 —— 即客户端打洞成功后立刻发起的 QUIC 握手，
+//	   这是**不需要客户端改动**的兼容判据（见 WatchPeerTraffic）。
+//
+// 对端重发的 PunchHello **不算**证据：它恰恰说明对端还没停下来，
+// 而对端是否收到我的 Ack 无从得知——把它当证据就退回了原来的假成功。
+//
+// trafficCh 必须由调用方在**发出 PunchAck 之前**登记好，否则存在丢失确认信号的竞态。
+func (p *ServerPuncher) confirmRoundTrip(
+	ctx context.Context,
+	trafficCh <-chan struct{},
+	eventCh chan PunchPacketEvent,
+	metadata PunchMetadata,
+	candidates []netip.AddrPort,
+	passiveOnly bool,
+	ticker *time.Ticker,
+	attemptID string,
+) bool {
+	timer := time.NewTimer(punchConfirmWindow)
+	defer timer.Stop()
+	for {
+		select {
+		case <-trafficCh:
+			// 对端的真实流量（QUIC 握手）到达 —— 回程确认。
+			return true
+		case event := <-eventCh:
+			switch event.Type {
+			case PunchAck:
+				return true
+			case PunchHello:
+				// 对端仍在重试：补发 Ack（前一个可能已丢），但不据此判定成功。
+				sendPunchPacket(p.conn, event.From, PunchAck, metadata)
+				if p.observer != nil {
+					p.observer.PunchAckSent(attemptID, event.From)
+				}
+			}
+		case <-ticker.C:
+			if !passiveOnly {
+				sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+			}
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
 		}
 	}
 }
