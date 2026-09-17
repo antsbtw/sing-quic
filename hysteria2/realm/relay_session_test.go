@@ -411,7 +411,7 @@ func TestLoopbackTarget(t *testing.T) {
 		want string
 	}{
 		{&net.UDPAddr{IP: net.IPv4zero, Port: 51820}, "127.0.0.1:51820"},
-		{&net.UDPAddr{IP: net.IPv6unspecified, Port: 51820}, "[::1]:51820"},
+		{&net.UDPAddr{IP: net.IPv6unspecified, Port: 51820}, "127.0.0.1:51820"},
 		{&net.UDPAddr{IP: nil, Port: 51820}, "127.0.0.1:51820"},
 		{&net.UDPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 51821}, "10.0.0.5:51821"},
 	}
@@ -423,5 +423,35 @@ func TestLoopbackTarget(t *testing.T) {
 	}
 	if _, ok := loopbackTarget(&net.UDPAddr{Port: 0}); ok {
 		t.Error("port 0 must be rejected")
+	}
+}
+
+// 生产节点的协议端口是双栈绑定（ss 显示 *:5182x，LocalAddr = [::]:port）。
+// 验证 127.0.0.1 回环能送进双栈 socket，且回包回得来。
+func TestIsolatedRelaySessionIntoDualStackProtocolSocket(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{}) // 双栈，LocalAddr = [::]:port
+	if err != nil {
+		t.Skipf("dual-stack listen unavailable: %v", err)
+	}
+	defer server.Close()
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, from, err := server.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			_, _ = server.WriteToUDPAddrPort(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+	relay := startMiniRelay(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nonce := testNonce(0x39)
+	go joinRelaysIsolated(ctx, server.LocalAddr(), []netip.AddrPort{relay.addr()}, nonce, nil)
+	client := newRelayTestClient(t, relay.addr(), nonce)
+	client.joinUntilAck(t)
+	if !client.roundTrip("dual-stack") {
+		t.Fatalf("round trip into dual-stack protocol socket (%v) failed", server.LocalAddr())
 	}
 }

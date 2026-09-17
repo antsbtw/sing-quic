@@ -86,17 +86,16 @@ func loopbackTarget(local net.Addr) (*net.UDPAddr, bool) {
 		return nil, false
 	}
 	ip := udpAddr.IP
-	switch {
-	case ip == nil || ip.IsUnspecified():
-		// 0.0.0.0 → 127.0.0.1；[::]（双栈或 v6only）→ ::1，两种绑定下都收得到。
-		if ip4 := ip.To4(); ip4 != nil || len(ip) == 0 {
-			ip = net.IPv4(127, 0, 0, 1)
-		} else {
-			ip = net.IPv6loopback
-		}
-	default:
-		// 绑了具体地址：本机发往该地址同样走 lo，直接用它。
+	if ip == nil || ip.IsUnspecified() {
+		// 未指定地址一律用 127.0.0.1，包括 [::]：Go 的 ListenUDP("udp", ":port") 在 Linux
+		// 上是双栈，v4 回环包以 ::ffff:127.0.0.1 到达——与生产上所有 IPv4 客户端走的是
+		// 同一条收发路径。选 ::1 反而要求节点的 IPv6 回环可用（有的机器 disable_ipv6），
+		// 且走的是线上几乎没流量验证过的 v6 路径。
+		// （若 socket 是 v6only，v4 回环包到不了 → L 上读不到回包 → 会话按 idle 回收，
+		// 客户端侧表现为中继回退失败；我们的节点没有这种绑定，真遇到用回滚开关。）
+		ip = net.IPv4(127, 0, 0, 1)
 	}
+	// 绑了具体地址：本机发往该地址同样走 lo，直接用它。
 	return &net.UDPAddr{IP: ip, Port: udpAddr.Port, Zone: udpAddr.Zone}, true
 }
 
