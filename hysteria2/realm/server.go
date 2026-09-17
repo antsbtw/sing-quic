@@ -255,8 +255,22 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 			// 同一份授权在链路上出现两次没有增益（feedback_module_responsibility_clarity）。
 			// 事件不带 relay（该 egress 无授权中继 / 老会合面 / 排水中）→ 不报到，
 			// 与配置驱动时代 RelayAddresses 为空的行为同型。
+			//
+			// ★S1（2026-09-17）：默认每会话独立 socket 报到（relay_session.go），
+			// 中继看到的节点地址每会话唯一，不再互顶。建不起来（fd 上限/回环地址
+			// 取不到）或 OTUN_RELAY_LEGACY_JOIN=1 时回退旧的共享 socket 报到。
 			if len(event.Relay) > 0 {
-				go joinRelays(ctx, s.punchConn, event.Relay, metadata.Nonce)
+				relays, nonce := event.Relay, metadata.Nonce
+				go func() {
+					if !relayLegacyJoinForced() {
+						sessionObserver, _ := s.options.Observer.(RelaySessionObserver)
+						if joinRelaysIsolated(ctx, s.punchConn.LocalAddr(), relays, nonce, sessionObserver) {
+							return
+						}
+						s.options.Logger.Warn("relay: isolated session unavailable; falling back to shared-socket join")
+					}
+					joinRelays(ctx, s.punchConn, relays, nonce)
+				}()
 			}
 			freshAddresses, stunErr := s.connectAddresses(ctx)
 			if stunErr != nil {
