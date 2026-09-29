@@ -180,6 +180,12 @@ func transmitSTUNRequests(conn net.PacketConn, requests []stunRequest, pending m
 		_, err := conn.WriteTo(request.rawMessage, net.UDPAddrFromAddrPort(request.server))
 		if err != nil {
 			sendErr = E.Errors(sendErr, E.Cause(err, "send STUN request to ", request.server))
+			// 发不出去的请求永远不会有应答，必须移出 pending。否则 runAttempt 以
+			// len(pending)>0 为循环条件，会把三轮 0.5+2+4s 全部等满：2026-09-29
+			// egress-nn-02 无 IPv6 路由，ResolveSTUNServers 仍解析出 Google 的 v6
+			// 地址 → sendto ENETUNREACH → 每次 STUN 恒 6.5s → 客户端 rendezvous
+			// 中位 6.8s（有 v6 的 nn-01 仅 0.35s）。
+			delete(pending, request.transactionID)
 			continue
 		}
 		sent++

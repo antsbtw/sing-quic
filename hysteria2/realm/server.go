@@ -24,6 +24,19 @@ const (
 	sseBackoffMax       = 30 * time.Second
 )
 
+// 以下两项为 var 仅为测试可缩短；生产不改。
+var (
+	// controlRequestTimeout 限定单次 register/heartbeat 请求。run 循环是单 goroutine，
+	// 原先心跳直接用长寿命 run ctx、HTTPClient 又无超时：到会合面的 TCP 半死时一次
+	// 心跳能挂到内核 TCP 超时（十几分钟），循环卡住 → 不再心跳 → 会合面 60s TTL 静默
+	// 过期 → realm_not_found，库内 404→reRegister 也跑不到，只能等 agent 自愈整体重建
+	// （2026-09-29 egress-nn-01-trojan，14 天 38 次）。
+	controlRequestTimeout = 10 * time.Second
+	// heartbeatRetryInterval：心跳失败后的重试间隔。TTL 60s、正常间隔 ttl/2=30s，
+	// 失败后仍等 30s 则一次失败 + 一次挂起就过期；5s 重试让 TTL 内有多次机会。
+	heartbeatRetryInterval = 5 * time.Second
+)
+
 type Resolver func(ctx context.Context, host string, ipv4, ipv6 bool) ([]netip.Addr, error)
 
 type Options struct {
@@ -151,14 +164,18 @@ func (s *Server) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-heartbeatTimer.C:
-			s.handleHeartbeat(ctx)
+			ok := s.handleHeartbeat(ctx)
 			s.sessionAccess.Lock()
 			heartbeatInterval = time.Duration(s.ttl/2) * time.Second
 			s.sessionAccess.Unlock()
 			if heartbeatInterval < time.Second {
 				heartbeatInterval = time.Second
 			}
-			heartbeatTimer.Reset(heartbeatInterval)
+			next := heartbeatInterval
+			if !ok && heartbeatRetryInterval < next {
+				next = heartbeatRetryInterval
+			}
+			heartbeatTimer.Reset(next)
 		case <-s.resetSignal:
 			s.handleReset(ctx)
 			if !heartbeatTimer.Stop() {
@@ -389,7 +406,9 @@ func (s *Server) connectAddresses(ctx context.Context) ([]netip.AddrPort, error)
 	return value.([]netip.AddrPort), nil
 }
 
-func (s *Server) handleHeartbeat(ctx context.Context) {
+// handleHeartbeat 返回本轮后会话是否健康（心跳成功或重注册成功）；false 时 run
+// 循环按 heartbeatRetryInterval 提前重试。
+func (s *Server) handleHeartbeat(ctx context.Context) bool {
 	s.sessionAccess.Lock()
 	sessionID := s.sessionID
 	s.sessionAccess.Unlock()
@@ -398,9 +417,9 @@ func (s *Server) handleHeartbeat(ctx context.Context) {
 		haveAddresses := len(s.addresses) > 0
 		s.addressAccess.RUnlock()
 		if haveAddresses {
-			s.reRegister(ctx)
+			return s.reRegister(ctx)
 		}
-		return
+		return false
 	}
 	s.addressAccess.RLock()
 	var publish []netip.AddrPort
@@ -408,19 +427,21 @@ func (s *Server) handleHeartbeat(ctx context.Context) {
 		publish = slices.Clone(s.addresses)
 	}
 	s.addressAccess.RUnlock()
-	ttl, err := s.controlClient.Heartbeat(ctx, s.options.RealmID, sessionID, publish, s.options.RelayAddresses)
+	requestCtx, cancel := context.WithTimeout(ctx, controlRequestTimeout)
+	ttl, err := s.controlClient.Heartbeat(requestCtx, s.options.RealmID, sessionID, publish, s.options.RelayAddresses)
+	cancel()
 	if err != nil {
 		statusErr, isStatus := E.Cast[*StatusError](err)
 		switch {
 		case isStatus && (statusErr.StatusCode == 401 || statusErr.StatusCode == 404):
 			s.options.Logger.Warn("session invalid, re-registering")
-			s.reRegister(ctx)
+			return s.reRegister(ctx)
 		case isStatus && statusErr.StatusCode == 400:
 			s.options.Logger.Error(E.Cause(err, "heartbeat fatal error"))
 		default:
 			s.options.Logger.Error(E.Cause(err, "heartbeat"))
 		}
-		return
+		return false
 	}
 	s.sessionAccess.Lock()
 	s.ttl = ttl
@@ -430,6 +451,7 @@ func (s *Server) handleHeartbeat(ctx context.Context) {
 		s.lastPublishedAddresses = publish
 		s.addressAccess.Unlock()
 	}
+	return true
 }
 
 // Reset coalesces network-change notifications; multiple calls in quick succession collapse into one re-discovery.
@@ -460,14 +482,16 @@ func (s *Server) handleReset(ctx context.Context) {
 	s.handleHeartbeat(ctx)
 }
 
-func (s *Server) reRegister(ctx context.Context) {
+func (s *Server) reRegister(ctx context.Context) bool {
 	s.addressAccess.RLock()
 	addresses := slices.Clone(s.addresses)
 	s.addressAccess.RUnlock()
-	registration, err := s.controlClient.Register(ctx, s.options.RealmID, addresses, s.options.RelayAddresses)
+	requestCtx, cancel := context.WithTimeout(ctx, controlRequestTimeout)
+	registration, err := s.controlClient.Register(requestCtx, s.options.RealmID, addresses, s.options.RelayAddresses)
+	cancel()
 	if err != nil {
 		s.options.Logger.Warn(E.Cause(err, "re-register"))
-		return
+		return false
 	}
 	s.sessionAccess.Lock()
 	s.sessionID = registration.SessionID
@@ -477,6 +501,7 @@ func (s *Server) reRegister(ctx context.Context) {
 	s.lastPublishedAddresses = addresses
 	s.addressAccess.Unlock()
 	s.options.Logger.Info("re-registered with control, session: ", registration.SessionID)
+	return true
 }
 
 func generateAttemptID() string {
