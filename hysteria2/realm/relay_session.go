@@ -62,11 +62,15 @@ type RelaySessionStats struct {
 	Relays      []netip.AddrPort // 本次报到的全部中继
 	Acked       []netip.AddrPort // 回了 ack（= 在该台完成配对）的中继
 	ActiveRelay netip.AddrPort   // 实际承载数据的那台；零值 = 从未有数据（打洞成功/竞速输家/客户端没来）
-	FirstAckMs  int64            // 发起到首个 ack；-1 = 从未 ack
-	BytesIn     uint64           // 中继 → 协议服务端
-	BytesOut    uint64           // 协议服务端 → 中继
-	Duration    time.Duration
-	CloseReason string // no_ack | idle | ctx_done | error
+	// LoopbackAddr 是本会话 L socket 的本机地址 = 协议服务端看到的"客户端地址"。
+	// 嵌入方的计量（conn_lifecycle 的 source）记的就是它，凭它把中继会话（有 nonce）
+	// 对到用户与流量。每会话唯一，但端口会随时间复用，关联时须同时限定会话时间窗。
+	LoopbackAddr netip.AddrPort
+	FirstAckMs   int64  // 发起到首个 ack；-1 = 从未 ack
+	BytesIn      uint64 // 中继 → 协议服务端
+	BytesOut     uint64 // 协议服务端 → 中继
+	Duration     time.Duration
+	CloseReason  string // no_ack | idle | ctx_done | error
 }
 
 // RelaySessionObserver 是可选扩展：Options.Observer 同时实现它时，会话结束回调一次。
@@ -139,6 +143,9 @@ func joinRelaysIsolated(
 		relays:  make(map[netip.AddrPort]*relayPeer, len(relayAddresses)),
 		started: time.Now(),
 	}
+	if local, ok := inner.LocalAddr().(*net.UDPAddr); ok {
+		session.loopback = normalizeAddrPort(local.AddrPort())
+	}
 	session.firstAck.Store(-1)
 	for _, addr := range relayAddresses {
 		session.relays[normalizeAddrPort(addr)] = &relayPeer{udp: net.UDPAddrFromAddrPort(addr)}
@@ -166,6 +173,8 @@ type relaySession struct {
 	inner  *net.UDPConn
 	nonce  [relayNonceLen]byte
 	relays map[netip.AddrPort]*relayPeer // 只读（构造后不增删）
+	// loopback：L 的本机地址，构造时取（socket 关闭后不再读）。
+	loopback netip.AddrPort
 
 	started      time.Time
 	lastActivity atomic.Int64 // unix nano
@@ -285,13 +294,14 @@ func (s *relaySession) pumpFromProtocol() {
 
 func (s *relaySession) stats(relayAddresses []netip.AddrPort, reason string) RelaySessionStats {
 	stats := RelaySessionStats{
-		Nonce:       s.nonce,
-		Relays:      relayAddresses,
-		FirstAckMs:  s.firstAck.Load(),
-		BytesIn:     s.bytesIn.Load(),
-		BytesOut:    s.bytesOut.Load(),
-		Duration:    time.Since(s.started),
-		CloseReason: reason,
+		Nonce:        s.nonce,
+		Relays:       relayAddresses,
+		FirstAckMs:   s.firstAck.Load(),
+		BytesIn:      s.bytesIn.Load(),
+		BytesOut:     s.bytesOut.Load(),
+		Duration:     time.Since(s.started),
+		CloseReason:  reason,
+		LoopbackAddr: s.loopback,
 	}
 	for addr, peer := range s.relays {
 		if peer.acked.Load() {

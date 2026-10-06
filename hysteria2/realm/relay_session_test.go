@@ -455,3 +455,64 @@ func TestIsolatedRelaySessionIntoDualStackProtocolSocket(t *testing.T) {
 		t.Fatalf("round trip into dual-stack protocol socket (%v) failed", server.LocalAddr())
 	}
 }
+
+// LoopbackAddr 必须等于协议服务端看到的对端地址：嵌入方凭它把节点计量里的
+// source（中继会话恒为 127.0.0.1:L端口）对到 nonce，进而对到用户与流量。
+func TestIsolatedRelaySessionReportsLoopbackAddrSeenByProtocolServer(t *testing.T) {
+	oldWindow, oldIdle := relaySessionJoinWindow, relaySessionIdle
+	relaySessionJoinWindow, relaySessionIdle = 400*time.Millisecond, 700*time.Millisecond
+	defer func() { relaySessionJoinWindow, relaySessionIdle = oldWindow, oldIdle }()
+
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	seen := make(chan netip.AddrPort, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := server.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			select {
+			case seen <- normalizeAddrPort(from):
+			default:
+			}
+			_, _ = server.WriteToUDPAddrPort(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+
+	relay := startMiniRelay(t)
+	observer := &captureRelayObserver{}
+	finished := make(chan struct{})
+	nonce := testNonce(0x5A)
+	go func() {
+		joinRelaysIsolated(context.Background(), server.LocalAddr(), []netip.AddrPort{relay.addr()}, nonce, observer)
+		close(finished)
+	}()
+	client := newRelayTestClient(t, relay.addr(), nonce)
+	client.joinUntilAck(t)
+	if !client.roundTrip("who-am-i") {
+		t.Fatal("round trip failed")
+	}
+	var from netip.AddrPort
+	select {
+	case from = <-seen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol server saw no packet")
+	}
+	select {
+	case <-finished:
+	case <-time.After(6 * time.Second):
+		t.Fatal("session was not reclaimed")
+	}
+	got := observer.stats[0].LoopbackAddr
+	if !got.IsValid() || got != from {
+		t.Fatalf("LoopbackAddr = %v, protocol server saw %v", got, from)
+	}
+	if !got.Addr().IsLoopback() {
+		t.Fatalf("LoopbackAddr %v is not a loopback address", got)
+	}
+}
