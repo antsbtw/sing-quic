@@ -160,12 +160,13 @@ func (s *Service[U]) Close() error {
 }
 
 func (s *Service[U]) handleConnection(connection *quic.Conn) {
-	setCongestion(s.ctx, connection, s.congestionControl)
+	connInfo := &qtls.ConnInfo{Conn: connection, CongestionControl: s.congestionControl}
+	setCongestion(s.ctx, connection, s.congestionControl, connInfo.WrapCongestion)
 	session := &serverSession[U]{
 		Service:    s,
 		ctx:        s.ctx,
 		quicConn:   connection,
-		connInfo:   &qtls.ConnInfo{Conn: connection, CongestionControl: s.congestionControl},
+		connInfo:   connInfo,
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),

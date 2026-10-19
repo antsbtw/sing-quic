@@ -293,7 +293,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger))
+			s.quicConn.SetCongestionControl(s.connInfo.WrapCongestion(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger)))
 			s.connInfo.CongestionControl = "brutal"
 			s.connInfo.BrutalRxBPS = rx
 		} else {
@@ -301,11 +301,11 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if timeFunc == nil {
 				timeFunc = time.Now
 			}
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.quicConn.SetCongestionControl(s.connInfo.WrapCongestion(congestion_meta2.NewBbrSenderWithProfile(
 				congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 				congestion.ByteCount(s.quicConn.Config().InitialPacketSize),
 				s.bbrProfile,
-			))
+			)))
 			s.connInfo.CongestionControl = "bbr"
 			rxAuto = true
 		}
