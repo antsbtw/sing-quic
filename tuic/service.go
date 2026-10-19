@@ -165,6 +165,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		Service:    s,
 		ctx:        s.ctx,
 		quicConn:   connection,
+		connInfo:   &qtls.ConnInfo{Conn: connection, CongestionControl: s.congestionControl},
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
@@ -176,6 +177,7 @@ type serverSession[U comparable] struct {
 	*Service[U]
 	ctx        context.Context
 	quicConn   *quic.Conn
+	connInfo   *qtls.ConnInfo
 	connAccess sync.Mutex
 	connDone   chan struct{}
 	connErr    error
@@ -360,7 +362,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	if !buffer.IsEmpty() {
 		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+	s.handler.NewConnectionEx(s.userContext(), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
 }
 
@@ -378,6 +380,13 @@ func (s *serverSession[U]) loopHeartbeats() {
 			}
 		}
 	}
+}
+
+// userContext is the context handed to the handler for every stream and
+// packet flow of this session: the authenticated user plus the QUIC
+// connection it rides on.
+func (s *serverSession[U]) userContext() context.Context {
+	return qtls.ContextWithConnInfo(auth.ContextWithUser(s.ctx, s.authUser), s.connInfo)
 }
 
 func (s *serverSession[U]) closeWithError(err error) {

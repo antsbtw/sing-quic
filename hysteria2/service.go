@@ -238,6 +238,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		Service:    s,
 		ctx:        s.ctx,
 		quicConn:   connection,
+		connInfo:   &qtls.ConnInfo{Conn: connection},
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint32]*udpPacketConn),
 	}
@@ -253,6 +254,7 @@ type serverSession[U comparable] struct {
 	*Service[U]
 	ctx           context.Context
 	quicConn      *quic.Conn
+	connInfo      *qtls.ConnInfo
 	connAccess    sync.Mutex
 	connDone      chan struct{}
 	connErr       error
@@ -280,9 +282,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.authUser = user
-		s.authenticated = true
 		var rxAuto bool
 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
+			s.authenticated = true
 			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
@@ -292,6 +294,8 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				rx = s.sendBPS
 			}
 			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger))
+			s.connInfo.CongestionControl = "brutal"
+			s.connInfo.BrutalRxBPS = rx
 		} else {
 			timeFunc := ntp.TimeFuncFromContext(s.ctx)
 			if timeFunc == nil {
@@ -302,8 +306,12 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				congestion.ByteCount(s.quicConn.Config().InitialPacketSize),
 				s.bbrProfile,
 			))
+			s.connInfo.CongestionControl = "bbr"
 			rxAuto = true
 		}
+		// Set after the congestion choice so streams dispatched on this
+		// session always see a complete connInfo.
+		s.authenticated = true
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 			UDPEnabled: !s.udpDisabled,
 			Rx:         s.receiveBPS,
@@ -355,8 +363,15 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	if err != nil {
 		return E.New("read TCP request")
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), M.ParseSocksaddr(destinationString).Unwrap(), nil)
+	s.handler.NewConnectionEx(s.userContext(), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), M.ParseSocksaddr(destinationString).Unwrap(), nil)
 	return nil
+}
+
+// userContext is the context handed to the handler for every stream and
+// packet flow of this session: the authenticated user plus the QUIC
+// connection it rides on.
+func (s *serverSession[U]) userContext() context.Context {
+	return qtls.ContextWithConnInfo(auth.ContextWithUser(s.ctx, s.authUser), s.connInfo)
 }
 
 func (s *serverSession[U]) closeWithError(err error) {
