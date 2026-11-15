@@ -158,6 +158,14 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 	s.userMap = userMap
 }
 
+// SetRealmRegisterToken switches the realm registration key at runtime (see
+// realm.Server.SetRegisterToken). No-op when realm is not configured.
+func (s *Service[U]) SetRealmRegisterToken(token string) {
+	if s.realmServer != nil {
+		s.realmServer.SetRegisterToken(token)
+	}
+}
+
 func (s *Service[U]) Start(conn net.PacketConn) error {
 	if s.realmServer != nil {
 		return s.startWithRealm(conn)
