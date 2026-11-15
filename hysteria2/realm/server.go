@@ -482,6 +482,12 @@ func (s *Server) handleReset(ctx context.Context) {
 	s.handleHeartbeat(ctx)
 }
 
+// SetRegisterToken switches the key used for future registrations without
+// touching the live session (no re-register, no dropped connections).
+func (s *Server) SetRegisterToken(token string) {
+	s.controlClient.SetRegisterToken(token)
+}
+
 func (s *Server) reRegister(ctx context.Context) bool {
 	s.addressAccess.RLock()
 	addresses := slices.Clone(s.addresses)

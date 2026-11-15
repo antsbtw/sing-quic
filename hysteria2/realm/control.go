@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -20,6 +21,27 @@ type ControlClient struct {
 	serverURL  string
 	token      string
 	httpClient *http.Client
+	// registerToken, when set, replaces token for Register only. Lets an
+	// egress move to its own registration key at runtime: the live session
+	// keeps using its session credential, the next (re)register uses the key.
+	registerToken atomic.Pointer[string]
+}
+
+// SetRegisterToken sets the token used by Register (empty = fall back to the
+// shared token). Safe to call concurrently with Register.
+func (c *ControlClient) SetRegisterToken(token string) {
+	if token == "" {
+		c.registerToken.Store(nil)
+		return
+	}
+	c.registerToken.Store(&token)
+}
+
+func (c *ControlClient) tokenForRegister() string {
+	if t := c.registerToken.Load(); t != nil {
+		return *t
+	}
+	return c.token
 }
 
 func NewControlClient(serverURL string, token string, httpClient *http.Client) (*ControlClient, error) {
@@ -159,7 +181,7 @@ func (c *ControlClient) doJSON(ctx context.Context, method, requestURL, token st
 
 func (c *ControlClient) Register(ctx context.Context, realmID string, addresses []netip.AddrPort, relay []netip.AddrPort) (*Registration, error) {
 	var registration Registration
-	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.token, registerRequest{Addresses: addresses, Relay: relay}, &registration)
+	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.tokenForRegister(), registerRequest{Addresses: addresses, Relay: relay}, &registration)
 	if err != nil {
 		return nil, E.Cause(err, "register")
 	}
