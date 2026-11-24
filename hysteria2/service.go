@@ -212,6 +212,10 @@ func (s *Service[U]) Close() error {
 	return E.Errors(realmErr, common.Close(s.quicListener))
 }
 
+// RealmServer 返回内嵌的会合面注册器（未启用 realm 时为 nil），供升级交接
+// 调用 Activate / Release（ZERO_DISRUPTION_UPGRADE_DESIGN §5.5）。
+func (s *Service[U]) RealmServer() *realm.Server { return s.realmServer }
+
 func (s *Service[U]) Reset() {
 	if s.realmServer != nil {
 		s.realmServer.Reset()

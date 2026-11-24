@@ -63,6 +63,9 @@ type Options struct {
 	// (see PunchObserver). nil — the default — disables observation and keeps
 	// the punch path exactly as before.
 	Observer PunchObserver
+	// DeferRegister=true：Start 只接管 socket、起数据面，不向会合面注册，等调用方
+	// Activate（升级交接时新进程先就绪、后接管槽位，ZERO_DISRUPTION_UPGRADE_DESIGN §4.1）。
+	DeferRegister bool
 }
 
 type Server struct {
@@ -70,9 +73,18 @@ type Server struct {
 	controlClient *ControlClient
 	punchConn     *PunchPacketConn
 	puncher       *ServerPuncher
-	cancel        context.CancelFunc
-	done          chan struct{}
 	resetSignal   chan struct{}
+
+	// 两层生命周期（ZERO_DISRUPTION_UPGRADE_DESIGN §5.5）：
+	//   lifeCtx —— 节点（数据面）生命周期：Start 到 Close。中继会话挂在它上面，
+	//             所以"只注销"(Release) 之后已建好的中继隧道继续工作。
+	//   注册生命周期 —— Activate 到 Release：心跳、事件流、打洞应答。每次 Activate
+	//             新建一份，Release 取消并等 run 循环退出。
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+	regMu      sync.Mutex // 串行化 Activate / Release / Close
+	regCancel  context.CancelFunc
+	regDone    chan struct{} // 当前这次注册的 run 循环退出时关闭；nil = 未注册
 
 	addressAccess          sync.RWMutex
 	addresses              []netip.AddrPort
@@ -106,44 +118,125 @@ func NewServer(options Options) (*Server, error) {
 	return &Server{
 		options:       options,
 		controlClient: controlClient,
-		done:          make(chan struct{}),
 		resetSignal:   make(chan struct{}, 1),
 	}, nil
 }
 
+// Start 接管 conn 并（除非 Options.DeferRegister）开始向会合面注册。注册是异步的，
+// 失败由 run 循环按心跳节奏重试，与改动前行为一致。
 func (s *Server) Start(ctx context.Context, conn net.PacketConn) (*PunchPacketConn, error) {
 	punchConn := NewPunchPacketConn(conn, eventBufferSize)
 	punchConn.observer = s.options.Observer
 	s.punchConn = punchConn
-	runCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	s.puncher = NewServerPuncher(runCtx, punchConn)
-	s.puncher.observer = s.options.Observer
-	go s.run(runCtx)
-	s.Reset()
+	s.lifeCtx, s.lifeCancel = context.WithCancel(ctx)
+	if !s.options.DeferRegister {
+		s.regMu.Lock()
+		s.startRegistrationLocked()
+		s.regMu.Unlock()
+		s.Reset()
+	}
 	return punchConn, nil
 }
 
-func (s *Server) Close() error {
-	if s.cancel != nil {
-		s.cancel()
+// startRegistrationLocked 起一份新的注册生命周期（调用方持有 regMu，且当前未注册）。
+func (s *Server) startRegistrationLocked() context.Context {
+	runCtx, cancel := context.WithCancel(s.lifeCtx)
+	s.regCancel = cancel
+	s.regDone = make(chan struct{})
+	s.puncher = NewServerPuncher(runCtx, s.punchConn)
+	s.puncher.observer = s.options.Observer
+	go s.run(runCtx, s.regDone)
+	return runCtx
+}
+
+// Registered 报告当前是否处在注册生命周期里（Activate 之后、Release 之前）。
+// 不代表会合面上的会话此刻一定有效——那由 run 循环的心跳维护。
+func (s *Server) Registered() bool {
+	s.regMu.Lock()
+	defer s.regMu.Unlock()
+	return s.regDone != nil
+}
+
+// Activate 同步完成一次注册并开始心跳/事件流（交接时由新进程调用）。
+// takeover=true 请求会合面原子替换同令牌持有的旧会话（会合面需支持 takeover；
+// 老会合面忽略该字段，槽位被占时照旧返回 409，调用方据 IsRealmTaken 回退为
+// "先让旧进程 Release 再 Activate"）。已注册时直接返回 nil。
+func (s *Server) Activate(ctx context.Context, takeover bool) error {
+	s.regMu.Lock()
+	defer s.regMu.Unlock()
+	if s.punchConn == nil {
+		return E.New("realm server not started")
 	}
-	if s.puncher != nil {
-		s.puncher.Close()
+	if s.regDone != nil {
+		return nil
 	}
-	s.sessionAccess.Lock()
-	sessionID := s.sessionID
-	s.sessionAccess.Unlock()
-	if sessionID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := s.controlClient.Deregister(ctx, s.options.RealmID, sessionID)
-		cancel()
+	addresses, err := s.connectAddresses(ctx)
+	if err != nil && len(addresses) == 0 {
+		return E.Cause(err, "discover addresses")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, controlRequestTimeout)
+	registration, err := s.controlClient.register(requestCtx, s.options.RealmID, addresses, s.options.RelayAddresses, takeover)
+	cancel()
+	if err != nil {
 		return err
 	}
+	s.sessionAccess.Lock()
+	s.sessionID = registration.SessionID
+	s.ttl = registration.TTL
+	s.sessionAccess.Unlock()
+	s.addressAccess.Lock()
+	s.lastPublishedAddresses = addresses
+	s.addressAccess.Unlock()
+	s.options.Logger.Info("registered with control (activate, takeover=", takeover, "), session: ", registration.SessionID)
+	s.startRegistrationLocked()
 	return nil
 }
 
-func (s *Server) run(ctx context.Context) {
+// Release 只注销：停止心跳、事件流和打洞应答，向会合面 Deregister，但**不**关闭
+// UDP socket、协议监听和已建好的隧道（直连与中继都继续服务）。交接时由旧进程调用；
+// 之后可再 Activate（回滚）。未注册时返回 nil。
+func (s *Server) Release() error {
+	s.regMu.Lock()
+	defer s.regMu.Unlock()
+	return s.releaseLocked()
+}
+
+func (s *Server) releaseLocked() error {
+	if s.regDone == nil {
+		return nil
+	}
+	s.regCancel()
+	s.puncher.Close()
+	select {
+	case <-s.regDone:
+	case <-time.After(controlRequestTimeout + time.Second):
+		// run 循环卡在一次控制请求里也不能拖住交接；它会随 ctx 取消自行退出。
+	}
+	s.regDone, s.regCancel = nil, nil
+	s.sessionAccess.Lock()
+	sessionID := s.sessionID
+	s.sessionID = ""
+	s.sessionAccess.Unlock()
+	if sessionID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.controlClient.Deregister(ctx, s.options.RealmID, sessionID)
+}
+
+// Close 注销并结束节点生命周期（中继会话随之收尾）。
+func (s *Server) Close() error {
+	s.regMu.Lock()
+	err := s.releaseLocked()
+	s.regMu.Unlock()
+	if s.lifeCancel != nil {
+		s.lifeCancel()
+	}
+	return err
+}
+
+func (s *Server) run(ctx context.Context, done chan struct{}) {
 	eventStreamDone := make(chan struct{})
 	go func() {
 		defer close(eventStreamDone)
@@ -151,7 +244,7 @@ func (s *Server) run(ctx context.Context) {
 	}()
 	defer func() {
 		<-eventStreamDone
-		close(s.done)
+		close(done)
 	}()
 	heartbeatInterval := time.Duration(s.ttl/2) * time.Second
 	if heartbeatInterval < time.Second {
@@ -281,12 +374,15 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 				go func() {
 					if !relayLegacyJoinForced() {
 						sessionObserver, _ := s.options.Observer.(RelaySessionObserver)
-						if joinRelaysIsolated(ctx, s.punchConn.LocalAddr(), relays, nonce, sessionObserver) {
+						// ★中继会话挂节点生命周期（lifeCtx），不挂注册生命周期：交接时
+						// 旧进程 Release 后，已建好的中继隧道要继续服务（§5.5，11-24 实测
+						// 挂注册 ctx 时注销即断）。
+						if joinRelaysIsolated(s.lifeCtx, s.punchConn.LocalAddr(), relays, nonce, sessionObserver) {
 							return
 						}
 						s.options.Logger.Warn("relay: isolated session unavailable; falling back to shared-socket join")
 					}
-					joinRelays(ctx, s.punchConn, relays, nonce)
+					joinRelays(s.lifeCtx, s.punchConn, relays, nonce)
 				}()
 			}
 			freshAddresses, stunErr := s.connectAddresses(ctx)

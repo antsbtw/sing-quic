@@ -95,7 +95,7 @@ func TestHeartbeatFailureRetriesSoonAndReRegisters(t *testing.T) {
 	s.ttl = 2 // 首次心跳在 1s 后；失败后若仍按 ttl/2 要再等 1s
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.run(ctx)
+	go s.run(ctx, make(chan struct{}))
 
 	deadline := time.Now().Add(3 * time.Second)
 	for registers.Load() == 0 && time.Now().Before(deadline) {

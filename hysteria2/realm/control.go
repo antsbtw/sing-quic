@@ -84,6 +84,9 @@ type registerRequest struct {
 	// 由节点上报、会合面原样转发给客户端 —— 会合面不持有这份配置，避免同一
 	// 事实出现第二个真源。空 = 未配中继（omitempty，老会合面忽略未知字段）。
 	Relay []netip.AddrPort `json:"relay,omitempty"`
+	// Takeover 请求会合面原子替换同令牌已持有的该槽会话（升级交接用，
+	// ZERO_DISRUPTION_UPGRADE_DESIGN §5.4）。老会合面忽略未知字段，照旧 409。
+	Takeover bool `json:"takeover,omitempty"`
 }
 
 type heartbeatRequest struct {
@@ -158,8 +161,12 @@ func (c *ControlClient) doJSON(ctx context.Context, method, requestURL, token st
 }
 
 func (c *ControlClient) Register(ctx context.Context, realmID string, addresses []netip.AddrPort, relay []netip.AddrPort) (*Registration, error) {
+	return c.register(ctx, realmID, addresses, relay, false)
+}
+
+func (c *ControlClient) register(ctx context.Context, realmID string, addresses []netip.AddrPort, relay []netip.AddrPort, takeover bool) (*Registration, error) {
 	var registration Registration
-	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.token, registerRequest{Addresses: addresses, Relay: relay}, &registration)
+	err := c.doJSON(ctx, http.MethodPost, c.realmURL(realmID, ""), c.token, registerRequest{Addresses: addresses, Relay: relay, Takeover: takeover}, &registration)
 	if err != nil {
 		return nil, E.Cause(err, "register")
 	}
@@ -326,4 +333,10 @@ func checkStatus(response *http.Response) error {
 		ErrorCode:  errorResult.Error,
 		Message:    errorResult.Message,
 	}
+}
+
+// IsRealmTaken 报告 err 是否为会合面的 409 realm_taken（槽位已被其他会话持有）。
+func IsRealmTaken(err error) bool {
+	statusErr, ok := E.Cast[*StatusError](err)
+	return ok && statusErr.StatusCode == http.StatusConflict
 }
