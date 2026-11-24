@@ -149,6 +149,14 @@ func (s *Server) startRegistrationLocked() context.Context {
 	return runCtx
 }
 
+// SessionID 返回当前会合面会话 id（未注册为空）。交接时旧进程经本机管理 socket
+// 把它交给新进程作 takeover 凭证；它本身就是会话的 bearer 凭证，不得外传。
+func (s *Server) SessionID() string {
+	s.sessionAccess.Lock()
+	defer s.sessionAccess.Unlock()
+	return s.sessionID
+}
+
 // Registered 报告当前是否处在注册生命周期里（Activate 之后、Release 之前）。
 // 不代表会合面上的会话此刻一定有效——那由 run 循环的心跳维护。
 func (s *Server) Registered() bool {
@@ -158,10 +166,10 @@ func (s *Server) Registered() bool {
 }
 
 // Activate 同步完成一次注册并开始心跳/事件流（交接时由新进程调用）。
-// takeover=true 请求会合面原子替换同令牌持有的旧会话（会合面需支持 takeover；
-// 老会合面忽略该字段，槽位被占时照旧返回 409，调用方据 IsRealmTaken 回退为
-// "先让旧进程 Release 再 Activate"）。已注册时直接返回 nil。
-func (s *Server) Activate(ctx context.Context, takeover bool) error {
+// takeoverSession 非空 = 请求会合面原子替换该槽当前会话，值须为旧进程的
+// SessionID()（会合面需支持；老会合面忽略该字段，槽位被占时照旧返回 409，调用方
+// 据 IsRealmTaken 回退为"先让旧进程 Release 再 Activate"）。已注册时直接返回 nil。
+func (s *Server) Activate(ctx context.Context, takeoverSession string) error {
 	s.regMu.Lock()
 	defer s.regMu.Unlock()
 	if s.punchConn == nil {
@@ -175,7 +183,7 @@ func (s *Server) Activate(ctx context.Context, takeover bool) error {
 		return E.Cause(err, "discover addresses")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, controlRequestTimeout)
-	registration, err := s.controlClient.register(requestCtx, s.options.RealmID, addresses, s.options.RelayAddresses, takeover)
+	registration, err := s.controlClient.register(requestCtx, s.options.RealmID, addresses, s.options.RelayAddresses, takeoverSession)
 	cancel()
 	if err != nil {
 		return err
@@ -187,7 +195,7 @@ func (s *Server) Activate(ctx context.Context, takeover bool) error {
 	s.addressAccess.Lock()
 	s.lastPublishedAddresses = addresses
 	s.addressAccess.Unlock()
-	s.options.Logger.Info("registered with control (activate, takeover=", takeover, "), session: ", registration.SessionID)
+	s.options.Logger.Info("registered with control (activate, takeover=", takeoverSession != "", "), session: ", registration.SessionID)
 	s.startRegistrationLocked()
 	return nil
 }

@@ -36,7 +36,7 @@ func (f *fakeControl) handler() http.Handler {
 			var req registerRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			f.registers = append(f.registers, req)
-			if f.taken && !req.Takeover {
+			if f.taken && req.TakeoverSession != "sess-old" {
 				w.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "realm_taken"})
 				return
@@ -97,17 +97,20 @@ func TestDeferActivateReleaseReactivate(t *testing.T) {
 		t.Fatalf("deferred server registered on Start (registers=%d)", reg)
 	}
 
-	if err := s.Activate(context.Background(), true); err != nil {
+	if err := s.Activate(context.Background(), "sess-old"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	if !s.Registered() {
 		t.Fatal("Registered()=false after Activate")
 	}
 	fc.mu.Lock()
-	takeover := fc.registers[0].Takeover
+	takeover := fc.registers[0].TakeoverSession
 	fc.mu.Unlock()
-	if !takeover {
-		t.Fatal("Activate(takeover=true) did not send takeover in register body")
+	if takeover != "sess-old" {
+		t.Fatalf("Activate did not send takeover_session (got %q)", takeover)
+	}
+	if s.SessionID() == "" {
+		t.Fatal("SessionID empty after Activate")
 	}
 
 	if err := s.Release(); err != nil {
@@ -134,7 +137,7 @@ func TestDeferActivateReleaseReactivate(t *testing.T) {
 	}
 
 	// 回滚：同一个 Server 再次 Activate。
-	if err := s.Activate(context.Background(), false); err != nil {
+	if err := s.Activate(context.Background(), ""); err != nil {
 		t.Fatalf("re-Activate: %v", err)
 	}
 	if reg, _ := fc.counts(); reg != 2 {
@@ -159,7 +162,7 @@ func TestActivateRealmTakenIsDetectable(t *testing.T) {
 	defer ts.Close()
 
 	s, _, _ := newHandoverServer(t, ts.URL, true)
-	err := s.Activate(context.Background(), false)
+	err := s.Activate(context.Background(), "")
 	if err == nil || !IsRealmTaken(err) {
 		t.Fatalf("want realm_taken, got %v", err)
 	}
@@ -170,7 +173,7 @@ func TestActivateRealmTakenIsDetectable(t *testing.T) {
 	fc.mu.Lock()
 	fc.taken = false
 	fc.mu.Unlock()
-	if err := s.Activate(context.Background(), false); err != nil {
+	if err := s.Activate(context.Background(), ""); err != nil {
 		t.Fatalf("retry Activate: %v", err)
 	}
 	_ = s.Close()
